@@ -1,3 +1,4 @@
 aiogram==2.25.2
 aiocryptopay
 requests
+aiohttp==3.8.6
