@@ -274,7 +274,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         f"  🇧🇾 Беларусь\n  🇲🇩 Молдова\n  🇷🇴 Румыния\n\n"
         f"⏱ Среднее время: 5–15 минут\n"
         f"🔄 Курсы обновляются каждые {RATES_TTL} сек.\n"
-        f"📣 Канал: @VeloxExchange\n"
+        f"📣 Канал: @VeloxPay\n"
         f"🛠 Поддержка: {SUPPORT}",
         parse_mode="HTML", reply_markup=main_menu)
 
