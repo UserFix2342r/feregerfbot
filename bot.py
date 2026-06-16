@@ -243,6 +243,51 @@ async def rates_updater():
             print(f"[rates] Ошибка: {exc}")
         await asyncio.sleep(RATES_TTL)
 
+# ───────────────────────── ВЕБХУК CRYPTOBOT ───────────────────────────────
+async def cryptobot_invoice_poller():
+    """Периодически проверяем оплаченные инвойсы CryptoBot и уведомляем пользователя."""
+    paid_invoices = set()
+    while True:
+        try:
+            invoices = await crypto_pay.get_invoices(status="paid")
+            for inv in (invoices.items if hasattr(invoices, "items") else []):
+                if inv.invoice_id in paid_invoices:
+                    continue
+                paid_invoices.add(inv.invoice_id)
+                # Ищем заявку по сумме и крипте
+                for w in stats["withdrawals"]:
+                    if (
+                        w.get("method") == "CryptoBot"
+                        and w.get("status") == "pending"
+                        and str(w.get("crypto")) == str(inv.asset)
+                        and abs(float(w.get("amount", 0)) - float(inv.amount)) < 1e-8
+                    ):
+                        w["status"] = "paid"
+                        uid = w["user_id"]
+                        try:
+                            await bot.send_message(
+                                uid,
+                                f"✅ <b>Оплата получена!</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"💸 {fmt(w['amount'],6)} {w['crypto']} → ≈{fmt(w['payout'])} {w['currency']}\n"
+                                f"💳 <code>{w['card']}</code>\n\n"
+                                f"⏳ Обрабатываем выплату, ожидайте 5–15 минут.\nПо вопросам: {SUPPORT}",
+                                parse_mode="HTML")
+                        except Exception: pass
+                        try:
+                            await bot.send_message(
+                                ADMIN_ID,
+                                f"💰 <b>Оплата CryptoBot — заявка #{w['id']}</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"👤 @{w['username']}\n"
+                                f"💸 {fmt(w['amount'],6)} {w['crypto']} → ≈{fmt(w['payout'])} {w['currency']}\n"
+                                f"💳 <code>{w['card']}</code>",
+                                parse_mode="HTML",
+                                reply_markup=withdrawal_admin_kb(w["id"]))
+                        except Exception: pass
+                        break
+        except Exception as exc:
+            print(f"[cryptobot_poller] Ошибка: {exc}")
+        await asyncio.sleep(15)  # проверяем каждые 15 секунд
+
 # ───────────────────────── ПРОВЕРКА БАНА ──────────────────────────────────
 async def check_ban(message):
     uid = message.from_user.id
@@ -1036,8 +1081,16 @@ async def mod_exit(message: types.Message, state: FSMContext):
 #  ЗАПУСК
 # ═══════════════════════════════════════════════════════════════════════════
 async def on_startup(_):
+    global _rates_cache
     print("⚡ VeloxPay запускается...")
+    # Сразу загружаем курсы при старте, чтобы не было fallback в первые секунды
+    try:
+        _rates_cache = await asyncio.get_event_loop().run_in_executor(None, _fetch_rates)
+        print("[rates] Начальные курсы загружены")
+    except Exception as exc:
+        print(f"[rates] Ошибка при начальной загрузке: {exc}")
     asyncio.create_task(rates_updater())
+    asyncio.create_task(cryptobot_invoice_poller())
 
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
