@@ -1,6 +1,9 @@
 import asyncio
+import re
+import sqlite3
 import requests
 from datetime import datetime, date, timedelta
+from contextlib import closing
 
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import (
@@ -20,6 +23,11 @@ SUPPORT        = "@VeloxPay_support1"
 ADMIN_ID       = 1891161256
 MIN_RUB        = 40
 RATES_TTL      = 30
+
+# ─── Реферальная программа ───
+REF_PERCENT      = 10     # % от суммы обмена (в USDT-эквиваленте), начисляемый рефереру
+MAX_REF_REWARD   = 50.0   # максимум начисления за одну заявку, USDT
+MIN_REF_WITHDRAW = 5.0    # минимальная сумма вывода реферального баланса, USDT
 
 CRYPTO_ADDRESSES = {
     "USDT": "TXN1SLgXdPCeVonpFneXNYrVM1C2yVD3eE",
@@ -48,7 +56,7 @@ COINGECKO_IDS = {
 }
 
 FALLBACK_RUB  = {"USDT": 90, "BTC": 8_500_000, "TON": 270, "ETH": 320_000, "SOL": 14_000}
-FALLBACK_COEF = {"rub": 1.0, "kzt": 5.2, "uah": 3.8, "pln": 0.33, "byn": 0.30, "mdl": 1.85, "ron": 0.50}
+FALLBACK_COEF = {"rub": 1.0, "kzt": 5.2, "uah": 3.8, "pln": 0.33, "byn": 0.30, "mdl": 1.85, "ron": 0.50, "usd": 0.011}
 
 # ───────────────────────── СОСТОЯНИЯ FSM ──────────────────────────────────
 class ExchangeState(StatesGroup):
@@ -79,6 +87,10 @@ class SetRateState(StatesGroup):
     waiting_for_crypto   = State()
     waiting_for_value    = State()
 
+class RefWithdrawState(StatesGroup):
+    waiting_card    = State()
+    waiting_address = State()
+
 # ───────────────────────── ДАННЫЕ ─────────────────────────────────────────
 stats = {
     "unique_today"  : set(),
@@ -94,6 +106,224 @@ _rates_cache        = {}
 _manual_rates       = {}   # ручные коэффициенты комиссии: {символ: float}
 user_data           = {}
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  РЕФЕРАЛЬНАЯ СИСТЕМА — хранилище SQLite (таблицы создаются в init_ref_db)
+#  referrals / ref_rewards / ref_withdraw_requests / ref_withdraw_history
+# ═══════════════════════════════════════════════════════════════════════════
+REF_DB_PATH = "referrals.db"
+
+def _ref_connect():
+    conn = sqlite3.connect(REF_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _ref_now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def init_ref_db():
+    with closing(_ref_connect()) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS referrals (
+                user_id     INTEGER PRIMARY KEY,
+                referrer_id INTEGER NOT NULL,
+                username    TEXT,
+                created_at  TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ref_rewards (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id          INTEGER NOT NULL,
+                referred_id          INTEGER NOT NULL,
+                withdrawal_id        INTEGER,
+                exchange_amount_usdt REAL NOT NULL,
+                reward_amount        REAL NOT NULL,
+                created_at           TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ref_withdraw_requests (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      INTEGER NOT NULL,
+                amount       REAL NOT NULL,
+                method       TEXT NOT NULL,        -- 'card' | 'crypto'
+                network      TEXT,                  -- TRC20/TON/ERC20/SOL (если crypto)
+                requisites   TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',  -- pending/approved/rejected
+                created_at   TEXT NOT NULL,
+                processed_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ref_withdraw_history (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER,
+                user_id    INTEGER NOT NULL,
+                amount     REAL NOT NULL,
+                method     TEXT NOT NULL,
+                network    TEXT,
+                requisites TEXT NOT NULL,
+                status     TEXT NOT NULL,           -- approved/rejected
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+
+# ── Реферер ──
+def get_referrer(user_id):
+    with closing(_ref_connect()) as conn:
+        row = conn.execute(
+            "SELECT referrer_id FROM referrals WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return row["referrer_id"] if row else None
+
+def set_referrer(user_id, referrer_id, username=None):
+    """INSERT OR IGNORE: реферер сохраняется только при первом запуске
+    и не может быть изменён позже. Самореферал блокируется отдельно."""
+    if user_id == referrer_id:
+        return False
+    with closing(_ref_connect()) as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO referrals (user_id, referrer_id, username, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, referrer_id, username or "", _ref_now()),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+def get_referred_list(referrer_id):
+    with closing(_ref_connect()) as conn:
+        rows = conn.execute(
+            "SELECT user_id, username, created_at FROM referrals "
+            "WHERE referrer_id = ? ORDER BY created_at DESC",
+            (referrer_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+def get_invited_count(referrer_id):
+    with closing(_ref_connect()) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM referrals WHERE referrer_id = ?", (referrer_id,)
+        ).fetchone()
+        return row["c"] if row else 0
+
+def get_active_count(referrer_id):
+    """Активный = реферал с хотя бы одним начислением (завершённый обмен)."""
+    with closing(_ref_connect()) as conn:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT referred_id) AS c FROM ref_rewards WHERE referrer_id = ?",
+            (referrer_id,),
+        ).fetchone()
+        return row["c"] if row else 0
+
+# ── Начисления ──
+def add_reward(referrer_id, referred_id, withdrawal_id, exchange_amount_usdt, reward_amount):
+    with closing(_ref_connect()) as conn:
+        conn.execute(
+            "INSERT INTO ref_rewards "
+            "(referrer_id, referred_id, withdrawal_id, exchange_amount_usdt, reward_amount, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (referrer_id, referred_id, withdrawal_id, exchange_amount_usdt, reward_amount, _ref_now()),
+        )
+        conn.commit()
+
+def get_rewards_history(referrer_id, limit=10):
+    with closing(_ref_connect()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM ref_rewards WHERE referrer_id = ? ORDER BY id DESC LIMIT ?",
+            (referrer_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+def get_total_earned(referrer_id):
+    with closing(_ref_connect()) as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(reward_amount), 0) AS s FROM ref_rewards WHERE referrer_id = ?",
+            (referrer_id,),
+        ).fetchone()
+        return round(row["s"] or 0, 2)
+
+# ── Баланс / вывод ──
+def get_total_withdrawn(user_id):
+    with closing(_ref_connect()) as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS s FROM ref_withdraw_history "
+            "WHERE user_id = ? AND status = 'approved'",
+            (user_id,),
+        ).fetchone()
+        return round(row["s"] or 0, 2)
+
+def get_pending_amount(user_id):
+    with closing(_ref_connect()) as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS s FROM ref_withdraw_requests "
+            "WHERE user_id = ? AND status = 'pending'",
+            (user_id,),
+        ).fetchone()
+        return round(row["s"] or 0, 2)
+
+def get_balance(user_id):
+    earned    = get_total_earned(user_id)
+    withdrawn = get_total_withdrawn(user_id)
+    pending   = get_pending_amount(user_id)
+    available = round(earned - withdrawn - pending, 2)
+    if available < 0:
+        available = 0.0
+    return {"earned": earned, "withdrawn": withdrawn, "pending": pending, "available": available}
+
+def has_pending_request(user_id):
+    """Защита от двойного вывода: пока есть необработанная заявка — новую создать нельзя."""
+    with closing(_ref_connect()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM ref_withdraw_requests WHERE user_id = ? AND status = 'pending' LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return row is not None
+
+def create_withdraw_request(user_id, amount, method, network, requisites):
+    with closing(_ref_connect()) as conn:
+        cur = conn.execute(
+            "INSERT INTO ref_withdraw_requests "
+            "(user_id, amount, method, network, requisites, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            (user_id, amount, method, network, requisites, _ref_now()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+def get_withdraw_request(request_id):
+    with closing(_ref_connect()) as conn:
+        row = conn.execute(
+            "SELECT * FROM ref_withdraw_requests WHERE id = ?", (request_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+def set_withdraw_request_status(request_id, status):
+    with closing(_ref_connect()) as conn:
+        conn.execute(
+            "UPDATE ref_withdraw_requests SET status = ?, processed_at = ? WHERE id = ?",
+            (status, _ref_now(), request_id),
+        )
+        conn.commit()
+
+def add_withdraw_history(request_id, user_id, amount, method, network, requisites, status):
+    with closing(_ref_connect()) as conn:
+        conn.execute(
+            "INSERT INTO ref_withdraw_history "
+            "(request_id, user_id, amount, method, network, requisites, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (request_id, user_id, amount, method, network, requisites, status, _ref_now()),
+        )
+        conn.commit()
+
+def get_withdraw_history(user_id, limit=10):
+    with closing(_ref_connect()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM ref_withdraw_history WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
 # ───────────────────────── AIOGRAM ────────────────────────────────────────
 storage    = MemoryStorage()
 bot        = Bot(token=TOKEN)
@@ -104,6 +334,7 @@ crypto_pay = AioCryptoPay(token=CRYPTO_BOT_API, network=Networks.MAIN_NET)
 main_menu = ReplyKeyboardMarkup(resize_keyboard=True)
 main_menu.add(KeyboardButton("💸 Обменять крипту"))
 main_menu.add(KeyboardButton("📜 История операций"), KeyboardButton("❓ FAQ"))
+main_menu.add(KeyboardButton("👥 Реферальная программа"))
 main_menu.add(KeyboardButton("🛠 Поддержка 24/7"))
 
 admin_menu = ReplyKeyboardMarkup(resize_keyboard=True)
@@ -138,6 +369,43 @@ block_duration_kb.add(
     InlineKeyboardButton("30 дней",  callback_data="ban_30d"),
     InlineKeyboardButton("Навсегда", callback_data="ban_forever"),
 )
+
+# ── Реферальная программа: клавиатуры ──
+ref_menu = ReplyKeyboardMarkup(resize_keyboard=True)
+ref_menu.add(KeyboardButton("🔗 Моя ссылка"), KeyboardButton("👥 Приглашённые"))
+ref_menu.add(KeyboardButton("📊 Статистика"), KeyboardButton("💰 Баланс"))
+ref_menu.add(KeyboardButton("📜 История"), KeyboardButton("💳 Вывести бонус"))
+ref_menu.add(KeyboardButton("⬅️ Назад"))
+
+ref_withdraw_method_kb = InlineKeyboardMarkup(row_width=1)
+ref_withdraw_method_kb.add(
+    InlineKeyboardButton("💳 Банковская карта", callback_data="refw_method:card"),
+    InlineKeyboardButton("🪙 Криптокошелёк",     callback_data="refw_method:crypto"),
+)
+
+ref_network_kb = InlineKeyboardMarkup(row_width=2)
+ref_network_kb.add(
+    InlineKeyboardButton("TRC20", callback_data="refw_net:TRC20"),
+    InlineKeyboardButton("TON",   callback_data="refw_net:TON"),
+    InlineKeyboardButton("ERC20", callback_data="refw_net:ERC20"),
+    InlineKeyboardButton("SOL",   callback_data="refw_net:SOL"),
+)
+
+def ref_withdraw_admin_kb(req_id):
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Подтвердить", callback_data=f"refw_approve:{req_id}"),
+        InlineKeyboardButton("❌ Отклонить",   callback_data=f"refw_reject:{req_id}"),
+    )
+    return kb
+
+# ── Валидаторы крипто-адресов по сетям (минимальная длина + базовый формат) ──
+NETWORK_VALIDATORS = {
+    "TRC20": lambda a: bool(re.fullmatch(r"T[1-9A-HJ-NP-Za-km-z]{33}", a)),
+    "ERC20": lambda a: bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", a)),
+    "TON"  : lambda a: bool(re.fullmatch(r"[A-Za-z0-9_-]{48,67}", a)),
+    "SOL"  : lambda a: bool(re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", a)),
+}
 
 # ───────────────────────── УТИЛИТЫ ────────────────────────────────────────
 def fmt(value, decimals=2):
@@ -207,7 +475,7 @@ def get_withdrawal_by_id(wid):
 # ───────────────────────── КУРСЫ ──────────────────────────────────────────
 def _fetch_rates():
     ids  = ",".join(COINGECKO_IDS.values())
-    curs = ",".join({m[3] for m in COUNTRY_META.values()})
+    curs = ",".join({m[3] for m in COUNTRY_META.values()} | {"usd"})
     resp = requests.get(
         "https://api.coingecko.com/api/v3/simple/price",
         params={"ids": ids, "vs_currencies": curs}, timeout=8
@@ -231,6 +499,11 @@ def get_rates(currency_code):
         cur,
         {s: round(FALLBACK_RUB[s] * FALLBACK_COEF.get(cur,1.0), 6) for s in COINGECKO_IDS}
     )
+
+def to_usdt(crypto, amount):
+    """USDT-эквивалент суммы обмена (используется для расчёта реферального бонуса)."""
+    usd_rate = get_rates("usd").get(crypto, 0)
+    return round(amount * usd_rate, 6)
 
 async def rates_updater():
     global _rates_cache
@@ -321,7 +594,20 @@ async def ask_for_card(chat_id, state, wid):
 async def cmd_start(message: types.Message, state: FSMContext):
     if not await check_ban(message): return
     await state.finish()
+    uid    = message.from_user.id
+    is_new = uid not in stats["all_users"]
     track_user(message.from_user)
+
+    # ── Реферальная привязка: только при первом запуске, без самореферала ──
+    if is_new:
+        arg = message.get_args().strip()
+        if arg.startswith("ref_"):
+            ref_part = arg[4:]
+            if ref_part.isdigit():
+                ref_id = int(ref_part)
+                if ref_id != uid:
+                    set_referrer(uid, ref_id, message.from_user.username)
+
     await message.answer(
         f"💸 <b>VeloxPay</b> — Крипто-обменник\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -669,6 +955,27 @@ async def approve_withdrawal(callback: types.CallbackQuery):
             f"⏱ Выплата поступит в течение 5–15 минут.\nПо вопросам: {SUPPORT}",
             parse_mode="HTML")
     except Exception: pass
+
+    # ── Реферальное начисление: ТОЛЬКО после одобрения модератором ──
+    try:
+        referrer_id = get_referrer(w["user_id"])
+        if referrer_id:
+            exchange_usdt = to_usdt(w["crypto"], w["amount"])
+            reward = round(min(exchange_usdt * REF_PERCENT / 100, MAX_REF_REWARD), 2)
+            if reward > 0:
+                add_reward(referrer_id, w["user_id"], w["id"], round(exchange_usdt, 2), reward)
+                try:
+                    await bot.send_message(
+                        referrer_id,
+                        f"🎉 <b>Реферальный бонус!</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"👤 Ваш реферал совершил обмен ≈{fmt(exchange_usdt)} USDT\n"
+                        f"💰 Начислено: <b>{fmt(reward)} USDT</b>\n\n"
+                        f"👥 Реферальная программа → 💰 Баланс",
+                        parse_mode="HTML")
+                except Exception: pass
+    except Exception as exc:
+        print(f"[referral] Ошибка начисления: {exc}")
+
     await callback.message.edit_text(callback.message.text + "\n\n<b>✅ Принята</b>", parse_mode="HTML")
     await callback.answer("✅ Принята")
 
@@ -1078,11 +1385,256 @@ async def mod_exit(message: types.Message, state: FSMContext):
     await message.answer("🏠 Главное меню", reply_markup=main_menu)
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  РЕФЕРАЛЬНАЯ ПРОГРАММА
+# ═══════════════════════════════════════════════════════════════════════════
+def ref_overview_text(uid):
+    bal     = get_balance(uid)
+    invited = get_invited_count(uid)
+    active  = get_active_count(uid)
+    return (
+        f"👥 <b>Реферальная программа</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 Приглашено: <b>{invited}</b>\n"
+        f"✅ Активных: <b>{active}</b>\n"
+        f"💸 Заработано: <b>{fmt(bal['earned'])} USDT</b>\n"
+        f"💰 К выводу: <b>{fmt(bal['available'])} USDT</b>"
+    )
+
+@dp.message_handler(lambda m: m.text == "👥 Реферальная программа", state="*")
+async def ref_open(message: types.Message, state: FSMContext):
+    if not await check_ban(message): return
+    await state.finish()
+    track_user(message.from_user)
+    await message.answer(
+        ref_overview_text(message.from_user.id) +
+        "\n\n━━━━━━━━━━━━━━━━━━━━━━━\n👇 Выберите раздел:",
+        parse_mode="HTML", reply_markup=ref_menu)
+
+@dp.message_handler(lambda m: m.text == "🔗 Моя ссылка", state="*")
+async def ref_link(message: types.Message):
+    if not await check_ban(message): return
+    uid  = message.from_user.id
+    link = f"https://t.me/VeloxPayExchange_bot?start=ref_{uid}"
+    await message.answer(
+        f"🔗 <b>Ваша реферальная ссылка</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"<code>{link}</code>\n\n"
+        f"За каждый завершённый обмен приглашённого вы получаете "
+        f"<b>{REF_PERCENT}%</b> от суммы его обмена "
+        f"(максимум {fmt(MAX_REF_REWARD)} USDT за заявку).",
+        parse_mode="HTML")
+
+@dp.message_handler(lambda m: m.text == "👥 Приглашённые", state="*")
+async def ref_invited(message: types.Message):
+    if not await check_ban(message): return
+    uid  = message.from_user.id
+    refs = get_referred_list(uid)
+    if not refs:
+        await message.answer("👥 У вас пока нет приглашённых пользователей."); return
+    active_ids = {r["referred_id"] for r in get_rewards_history(uid, limit=10_000)}
+    lines = []
+    for r in refs[:30]:
+        uname  = f"@{r['username']}" if r.get("username") else f"id{r['user_id']}"
+        status = "✅ активен" if r["user_id"] in active_ids else "💤 без обменов"
+        lines.append(f"  • {uname} — {status}")
+    await message.answer(
+        f"👥 <b>Приглашённые</b> ({len(refs)})\n━━━━━━━━━━━━━━━━━━━━━━━\n\n" + "\n".join(lines),
+        parse_mode="HTML")
+
+@dp.message_handler(lambda m: m.text == "📊 Статистика", state="*")
+async def ref_stats(message: types.Message):
+    if not await check_ban(message): return
+    await message.answer(ref_overview_text(message.from_user.id), parse_mode="HTML")
+
+@dp.message_handler(lambda m: m.text == "💰 Баланс", state="*")
+async def ref_balance(message: types.Message):
+    if not await check_ban(message): return
+    bal = get_balance(message.from_user.id)
+    await message.answer(
+        f"💰 <b>Баланс рефералки</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"💸 Заработано всего: {fmt(bal['earned'])} USDT\n"
+        f"📤 Выведено: {fmt(bal['withdrawn'])} USDT\n"
+        f"⏳ В обработке: {fmt(bal['pending'])} USDT\n"
+        f"💰 Доступно к выводу: <b>{fmt(bal['available'])} USDT</b>\n\n"
+        f"Минимальный вывод: {fmt(MIN_REF_WITHDRAW)} USDT",
+        parse_mode="HTML")
+
+@dp.message_handler(lambda m: m.text == "📜 История", state="*")
+async def ref_history(message: types.Message):
+    if not await check_ban(message): return
+    uid     = message.from_user.id
+    rewards = get_rewards_history(uid, limit=10)
+    payouts = get_withdraw_history(uid, limit=10)
+    if not rewards and not payouts:
+        await message.answer("📜 История пуста."); return
+    lines = ["📜 <b>История рефералки</b>", "━━━━━━━━━━━━━━━━━━━━━━━", ""]
+    if rewards:
+        lines.append("<b>Начисления:</b>")
+        for r in rewards:
+            lines.append(f"  + {fmt(r['reward_amount'])} USDT — {r['created_at']}")
+        lines.append("")
+    if payouts:
+        lines.append("<b>Выводы:</b>")
+        status_label = {"approved": "✅ выплачено", "rejected": "❌ отклонено", "pending": "⏳ в обработке"}
+        for p in payouts:
+            lines.append(f"  − {fmt(p['amount'])} USDT — {status_label.get(p['status'], p['status'])} — {p['created_at']}")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+@dp.message_handler(lambda m: m.text == "💳 Вывести бонус", state="*")
+async def ref_withdraw_start(message: types.Message, state: FSMContext):
+    if not await check_ban(message): return
+    uid = message.from_user.id
+    if has_pending_request(uid):
+        await message.answer("⏳ У вас уже есть заявка на вывод в обработке. Дождитесь её рассмотрения.")
+        return
+    bal = get_balance(uid)
+    if bal["available"] < MIN_REF_WITHDRAW:
+        await message.answer(
+            f"❌ Недостаточно средств.\n"
+            f"💰 Доступно: {fmt(bal['available'])} USDT\n"
+            f"Минимальный вывод: {fmt(MIN_REF_WITHDRAW)} USDT")
+        return
+    await state.finish()
+    async with state.proxy() as d:
+        d["ref_withdraw_amount"] = bal["available"]
+    await message.answer(
+        f"💳 <b>Вывод бонуса</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Сумма к выводу: <b>{fmt(bal['available'])} USDT</b>\n\n"
+        f"👇 Выберите способ вывода:",
+        parse_mode="HTML", reply_markup=ref_withdraw_method_kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("refw_method:"), state="*")
+async def ref_withdraw_method(callback: types.CallbackQuery, state: FSMContext):
+    method = callback.data.split(":")[1]
+    data   = await state.get_data()
+    if "ref_withdraw_amount" not in data:
+        await callback.answer("⚠️ Сессия устарела, начните заново.", show_alert=True); return
+    async with state.proxy() as d:
+        d["ref_method"] = method
+    await callback.answer()
+    if method == "card":
+        await RefWithdrawState.waiting_card.set()
+        await callback.message.edit_text(
+            "💳 <b>Введите номер карты</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Формат: ровно 16 цифр, без пробелов и букв.\n"
+            "Пример: <code>5375411234567890</code>",
+            parse_mode="HTML")
+    else:
+        await callback.message.edit_text("🪙 <b>Выберите сеть кошелька</b>", parse_mode="HTML")
+        await callback.message.answer("👇", reply_markup=ref_network_kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("refw_net:"), state="*")
+async def ref_withdraw_network(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if "ref_withdraw_amount" not in data:
+        await callback.answer("⚠️ Сессия устарела, начните заново.", show_alert=True); return
+    network = callback.data.split(":")[1]
+    async with state.proxy() as d:
+        d["ref_network"] = network
+    await RefWithdrawState.waiting_address.set()
+    await callback.answer()
+    await callback.message.edit_text(
+        f"🪙 Сеть: <b>{network}</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n\nВведите адрес кошелька:",
+        parse_mode="HTML")
+
+@dp.message_handler(state=RefWithdrawState.waiting_card)
+async def ref_withdraw_card_entered(message: types.Message, state: FSMContext):
+    card = message.text.strip().replace(" ", "")
+    if not card.isdigit() or len(card) != 16:
+        await message.answer(
+            "❌ Неверный формат. Нужно ровно 16 цифр, без пробелов и букв.\n"
+            "Пример: <code>5375411234567890</code>", parse_mode="HTML")
+        return
+    data = await state.get_data()
+    await _ref_withdraw_finish(message, state, "card", None, card, data["ref_withdraw_amount"])
+
+@dp.message_handler(state=RefWithdrawState.waiting_address)
+async def ref_withdraw_address_entered(message: types.Message, state: FSMContext):
+    address   = message.text.strip()
+    data      = await state.get_data()
+    network   = data.get("ref_network")
+    validator = NETWORK_VALIDATORS.get(network)
+    if (not address) or " " in address or not validator or not validator(address):
+        await message.answer(
+            f"❌ Неверный адрес для сети <b>{network}</b>. Проверьте формат и отправьте ещё раз.",
+            parse_mode="HTML")
+        return
+    await _ref_withdraw_finish(message, state, "crypto", network, address, data["ref_withdraw_amount"])
+
+async def _ref_withdraw_finish(message, state, method, network, requisites, amount):
+    uid      = message.from_user.id
+    username = message.from_user.username
+    await state.finish()
+    req_id       = create_withdraw_request(uid, amount, method, network, requisites)
+    method_label = "💳 Банковская карта" if method == "card" else f"🪙 Крипта ({network})"
+    await message.answer(
+        f"✅ <b>Заявка на вывод создана!</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Сумма: {fmt(amount)} USDT\n"
+        f"📤 Способ: {method_label}\n\n"
+        f"⏳ Ожидайте подтверждения модератором.",
+        parse_mode="HTML", reply_markup=ref_menu)
+    uname = f"@{username}" if username else f"id{uid}"
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🆕 <b>Новая заявка на вывод рефералки</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"ID: {uname} (<code>{uid}</code>)\n"
+            f"Сумма: <b>{fmt(amount)} USDT</b>\n"
+            f"Способ: {method_label}\n"
+            f"Реквизиты: <code>{requisites}</code>",
+            parse_mode="HTML", reply_markup=ref_withdraw_admin_kb(req_id))
+    except Exception as e:
+        print(f"[ref_withdraw] {e}")
+
+# ── Модерация вывода реферального бонуса (только админ) ──
+@dp.callback_query_handler(lambda c: c.data.startswith("refw_approve:"), state="*")
+async def ref_withdraw_approve(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔️ Нет доступа.", show_alert=True); return
+    req_id = int(callback.data.split(":")[1])
+    req    = get_withdraw_request(req_id)
+    if not req or req["status"] != "pending":
+        await callback.answer("Уже обработана.", show_alert=True); return
+    set_withdraw_request_status(req_id, "approved")
+    add_withdraw_history(req_id, req["user_id"], req["amount"], req["method"],
+                                 req["network"], req["requisites"], "approved")
+    try:
+        await bot.send_message(
+            req["user_id"],
+            f"✅ <b>Вывод бонуса подтверждён!</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 {fmt(req['amount'])} USDT отправлено.\nПо вопросам: {SUPPORT}",
+            parse_mode="HTML")
+    except Exception: pass
+    await callback.message.edit_text(callback.message.text + "\n\n<b>✅ Подтверждена</b>", parse_mode="HTML")
+    await callback.answer("✅ Подтверждена")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("refw_reject:"), state="*")
+async def ref_withdraw_reject(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔️ Нет доступа.", show_alert=True); return
+    req_id = int(callback.data.split(":")[1])
+    req    = get_withdraw_request(req_id)
+    if not req or req["status"] != "pending":
+        await callback.answer("Уже обработана.", show_alert=True); return
+    set_withdraw_request_status(req_id, "rejected")
+    add_withdraw_history(req_id, req["user_id"], req["amount"], req["method"],
+                                 req["network"], req["requisites"], "rejected")
+    try:
+        await bot.send_message(
+            req["user_id"],
+            f"❌ <b>Вывод бонуса отклонён</b>\n━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"💰 {fmt(req['amount'])} USDT возвращены на баланс.\n"
+            f"Обратитесь в поддержку: {SUPPORT}",
+            parse_mode="HTML")
+    except Exception: pass
+    await callback.message.edit_text(callback.message.text + "\n\n<b>❌ Отклонена</b>", parse_mode="HTML")
+    await callback.answer("❌ Отклонена")
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  ЗАПУСК
 # ═══════════════════════════════════════════════════════════════════════════
 async def on_startup(_):
     global _rates_cache
     print("⚡ VeloxPay запускается...")
+    init_ref_db()
     # Сразу загружаем курсы при старте, чтобы не было fallback в первые секунды
     try:
         _rates_cache = await asyncio.get_event_loop().run_in_executor(None, _fetch_rates)
