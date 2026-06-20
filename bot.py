@@ -754,8 +754,7 @@ async def btn_faq(message: types.Message):
         f"💰 Минимальная сумма: {MIN_RUB} RUB\n"
         f"⏱ Время выплаты: 5–15 мин\n"
         f"🕐 Режим работы: 24/7\n"
-        f"📣 Канал: @VeloxExchange\n"
-        f"🛠 Поддержка: {SUPPORT}",
+        f"📣 Канал: @VeloxPay\n",
         parse_mode="HTML")
 
 @dp.message_handler(lambda m: m.text == "🛠 Поддержка 24/7", state="*")
