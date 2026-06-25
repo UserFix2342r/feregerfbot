@@ -17,7 +17,7 @@ from aiocryptopay import AioCryptoPay, Networks
 
 
 # ───────────────────────── НАСТРОЙКИ ──────────────────────────────────────
-TOKEN          = "8835994765:AAGio2gDLRLknD4-KjeBpSEuN2fnRfrXZ0I"
+TOKEN          = "8835994765:AAGVdl9_gqEICOOxjdMo63FwKmEpwaiH0q8"
 CRYPTO_BOT_API = "587097:AAdldQwK5tZdd01WdtylzeRSfnIaZzwCKpG"
 SUPPORT        = "@VeloxPay_support1"
 ADMIN_ID       = 1891161256
